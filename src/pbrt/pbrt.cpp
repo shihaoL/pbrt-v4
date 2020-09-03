@@ -37,6 +37,9 @@ void InitPBRT(const PBRTOptions &opt) {
         // gets going...
         std::string env = StringPrintf("CUDA_VISIBLE_DEVICES=%d", *Options->gpuDevice);
         _putenv(env.c_str());
+        // Now CUDA should only see a single device, so tell it that zero
+        // is the one to use.
+        *Options->gpuDevice = 0;
     }
 #endif  // PBRT_IS_WINDOWS
 
