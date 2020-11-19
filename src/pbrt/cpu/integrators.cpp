@@ -3324,6 +3324,259 @@ std::unique_ptr<SPPMIntegrator> SPPMIntegrator::Create(
                                             colorSpace);
 }
 
+void RISIntegrator::Render() {
+    thread_local Point2i threadPixel;
+    thread_local int threadSampleIndex;
+    CheckCallbackScope _([&]() {
+        return StringPrintf("Rendering failed at pixel (%d, %d) sample %d. Debug with "
+                            "\"--debugstart %d,%d,%d\"\n",
+                            threadPixel.x, threadPixel.y, threadSampleIndex,
+                            threadPixel.x, threadPixel.y, threadSampleIndex);
+    });
+
+    // Declare common variables for rendering image in tiles
+    std::vector<ScratchBuffer> scratchBuffers;
+    for (int i = 0; i < MaxThreadIndex(); ++i)
+        scratchBuffers.push_back(ScratchBuffer(65536));
+
+    std::vector<SamplerHandle> samplers = sampler_prototype_.Clone(MaxThreadIndex());
+    Bounds2i pixelBounds = camera_.GetFilm().PixelBounds();
+    int spp = sampler_prototype_.SamplesPerPixel();
+    ProgressReporter progress(int64_t(spp) * pixelBounds.Area(), "Rendering",
+                              Options->quiet);
+    reservoirs.resize(pixelBounds.Area());
+    pre_reservoirs.resize(pixelBounds.Area());
+    for (auto &r : reservoirs) {
+        r.reset();
+    }
+    int cspp = 0;
+    while (cspp < spp) {
+        ParallelFor2D(pixelBounds, [&](Bounds2i tileBounds) {
+            // Render image tile given by _tileBounds_
+            ScratchBuffer &scratchBuffer = scratchBuffers[ThreadIndex];
+            SamplerHandle &sampler = samplers[ThreadIndex];
+            for (Point2i pPixel : tileBounds) {
+                threadPixel = pPixel;
+                // Render samples in pixel _pPixel_
+                sampler.StartPixelSample(pPixel, cspp);
+                evaluate_pixel(pPixel, cspp, sampler, scratchBuffer);
+                scratchBuffer.Reset();
+            }
+            progress.Update(tileBounds.Area());
+        });
+        pre_reservoirs = reservoirs;
+        first_iter = false;
+        cspp++;
+    }
+    ImageMetadata metadata;
+    metadata.renderTimeSeconds = progress.ElapsedSeconds();
+    metadata.samplesPerPixel = spp;
+    camera_.InitMetadata(&metadata);
+    camera_.GetFilm().WriteImage(metadata, 1.0f / spp);
+}
+
+std::unique_ptr<RISIntegrator> RISIntegrator::Create(
+    const ParameterDictionary &parameters, CameraHandle camera, SamplerHandle sampler,
+    PrimitiveHandle aggregate, std::vector<LightHandle> lights, const FileLoc *loc) {
+    int M = parameters.GetOneInt("M", 32);
+    bool bias = parameters.GetOneBool("bias", true);
+    std::string lightStrategy = parameters.GetOneString("lightsampler", "bvh");
+    return std::make_unique<RISIntegrator>(camera, sampler, aggregate, lights,
+                                           lightStrategy, M, bias);
+}
+
+std::string RISIntegrator::ToString() const {
+    return StringPrintf("[ RISIntegrator lightSampler: %s M: %d bias: %d ]",
+                        light_sampler_, M_, bias_);
+}
+
+void RISIntegrator::evaluate_pixel(const Point2i &pPixel, int sampleIndex,
+                                   SamplerHandle sampler, ScratchBuffer &scratchBuffer) {
+    FilterHandle filter = camera_.GetFilm().GetFilter();
+    CameraSample cameraSample = GetCameraSample(sampler, pPixel, filter);
+
+    // Sample wavelengths for the ray
+    Float lu = RadicalInverse(1, sampleIndex) + BlueNoise(47, pPixel);
+    if (lu >= 1)
+        lu -= 1;
+    if (Options->disableWavelengthJitter)
+        lu = 0.5;
+    SampledWavelengths lambda = camera_.GetFilm().SampleWavelengths(lu);
+
+    // Generate camera ray for current sample
+    pstd::optional<CameraRayDifferential> cameraRay =
+        camera_.GenerateRayDifferential(cameraSample, lambda);
+
+    SampledSpectrum L(0.);
+    VisibleSurface visibleSurface;
+    bool initializeVisibleSurface = camera_.GetFilm().UsesVisibleSurface();
+    // Trace _cameraRay_ if valid
+    if (cameraRay) {
+        // Double check that the ray's direction is normalized.
+        DCHECK_GT(Length(cameraRay->ray.d), .999f);
+        DCHECK_LT(Length(cameraRay->ray.d), 1.001f);
+        // Scale camera ray differentials based on sampling rate
+        Float rayDiffScale =
+            std::max<Float>(.125, 1 / std::sqrt((Float)sampler.SamplesPerPixel()));
+        if (!Options->disablePixelJitter)
+            cameraRay->ray.ScaleDifferentials(rayDiffScale);
+
+        ++nCameraRays;
+        // Evaluate radiance along camera ray
+        L = cameraRay->weight * li(pPixel, cameraRay->ray, lambda, sampler, scratchBuffer,
+                                   initializeVisibleSurface ? &visibleSurface : nullptr);
+
+        // Issue warning if unexpected radiance value is returned
+        if (L.HasNaNs()) {
+            LOG_ERROR("Not-a-number radiance value returned for pixel (%d, "
+                      "%d), sample %d. Setting to black.",
+                      pPixel.x, pPixel.y, sampleIndex);
+            L = SampledSpectrum(0.f);
+        } else if (IsInf(L.y(lambda))) {
+            LOG_ERROR("Infinite radiance value returned for pixel (%d, %d), "
+                      "sample %d. Setting to black.",
+                      pPixel.x, pPixel.y, sampleIndex);
+            L = SampledSpectrum(0.f);
+        }
+
+        if (cameraRay)
+            PBRT_DBG(
+                "%s\n",
+                StringPrintf("Camera sample: %s -> ray %s -> L = %s, visibleSurface %s",
+                             cameraSample, cameraRay->ray, L,
+                             (visibleSurface ? visibleSurface.ToString() : "(none)"))
+                    .c_str());
+        else
+            PBRT_DBG("%s\n",
+                     StringPrintf("Camera sample: %s -> no ray generated", cameraSample)
+                         .c_str());
+    }
+
+    // Add camera ray's contribution to image
+    camera_.GetFilm().AddSample(pPixel, L, lambda, &visibleSurface, cameraSample.weight);
+}
+
+SampledSpectrum RISIntegrator::li(const Point2i &pPixel, RayDifferential ray,
+                                  SampledWavelengths &lambda, SamplerHandle sampler,
+                                  ScratchBuffer &scratchBuffer,
+                                  VisibleSurface *visibleSurf) {
+    Bounds2i pixelBounds = camera_.GetFilm().PixelBounds();
+    auto pMax = pixelBounds.pMax;
+    auto pMin = pixelBounds.pMin;
+    uint32_t reservoir_idx = (pPixel.y - pMin.y) * (pMax.x - pMin.x) + pPixel.x;
+    SampledSpectrum L;
+    pstd::optional<ShapeIntersection> si = Intersect(ray);
+
+    // Account for infinite lights if ray has no intersection
+    if (!si) {
+        for (const auto &light : infiniteLights)
+            L += SafeDiv(light.Le(ray, lambda), lambda.PDF());
+        return L;
+    }
+
+    // Account for emsisive surface if light wasn't sampled
+    SurfaceInteraction &isect = si->intr;
+    L += SafeDiv(isect.Le(-ray.d, lambda), lambda.PDF());
+
+    // Get BSDF and skip over medium boundaries
+    BSDF bsdf = isect.GetBSDF(ray, lambda, camera_, scratchBuffer, sampler);
+    if (!bsdf) {
+        isect.SkipIntersection(&ray, si->tHit);
+        return L;
+    }
+    Vector3f wo = -ray.d;
+    auto cal_target_p = [&](const Vector3f &wi, const SampledSpectrum &L) {
+        SampledSpectrum f = bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n);
+        float target_p = (f * L).y(lambda);
+        return target_p;
+    };
+    auto &reservoir = reservoirs[reservoir_idx];
+    reservoir.reset();
+    int i = 0;
+    while (i < M_) {
+        pstd::optional<SampledLight> sampledLight =
+            light_sampler_.Sample(sampler.Get1D());
+        if (sampledLight) {
+            // Sample point on _sampledLight_ to estimate direct illumination
+            Point2f uLight = sampler.Get2D();
+            pstd::optional<LightLiSample> ls =
+                sampledLight->light.SampleLi(isect, uLight, lambda);
+            if (ls && ls->L && ls->pdf > 0) {
+                // Evaluate BSDF for light and possibly add scattered radiance
+                float target_p = cal_target_p(ls->wi, ls->L);
+                float weight = target_p / (sampledLight->pdf * ls->pdf);
+                reservoir.update(sampler, ls, weight);
+            } else {
+                reservoir.update(sampler, ls, 0);
+            }
+        } else {
+            reservoir.update(sampler, {}, 0);
+        }
+        i++;
+    }
+    if (reservoir.is_valid) {
+        float target_p = cal_target_p(reservoir.y->wi, reservoir.y->L);
+        reservoir.W = 1.f / target_p * (reservoir.W_sum / reservoir.M);
+        if (!Unoccluded(isect, reservoir.y->pLight)) {
+            reservoir.W = 0;
+        }
+    }
+
+    if (!first_iter) {
+        constexpr int k = 5;
+        constexpr int neighbor_size = 30;
+        int pre_samples[k + 1];
+        for (int i = 0; i < k; ++i) {
+            auto sample = sampler.Get2D();
+            auto offset = neighbor_size * (sample - Point2f(0.5, 0.5));
+            int x = offset.x;
+            int y = offset.y;
+            if (y >= pMin.y && y < pMax.y && x >= pMin.x && x < pMax.x) {
+                uint32_t idx = (y - pMin.y) * (pMax.x - pMin.x) + x;
+                pre_samples[i] = idx;
+            } else {
+                pre_samples[i] = -1;
+            }
+        }
+        pre_samples[k] = reservoir_idx;
+        Reservoir<pstd::optional<LightLiSample>> new_reservoir;
+        int M_sum = reservoir.M;
+        if (reservoir.is_valid) {
+            float target_p = cal_target_p(reservoir.y->wi, reservoir.y->L);
+            new_reservoir.update(sampler, reservoir.y,
+                                 target_p * reservoir.W * reservoir.M);
+        } else {
+            new_reservoir.update(sampler, {}, 0);
+        }
+        for (int i = 0; i < k + 1; ++i) {
+            if (pre_samples[i] < 0)
+                continue;
+            const auto &pre_sample = pre_reservoirs[pre_samples[i]];
+            if (pre_sample.is_valid) {
+                float target_p = cal_target_p(pre_sample.y->wi, pre_sample.y->L);
+                float weight = target_p * pre_sample.W * pre_sample.M;
+                new_reservoir.update(sampler, pre_sample.y, weight);
+            } else {
+                new_reservoir.update(sampler, {}, 0);
+            }
+            M_sum += pre_sample.M;
+        }
+        new_reservoir.M = M_sum;
+        if (new_reservoir.is_valid) {
+            float target_p = cal_target_p(new_reservoir.y->wi, new_reservoir.y->L);
+            new_reservoir.W = 1.f / target_p * (new_reservoir.W_sum / new_reservoir.M);
+        }
+        reservoir = new_reservoir;
+    }
+    if (reservoir.is_valid) {
+        Vector3f wi = reservoir.y->wi;
+        SampledSpectrum f = bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n);
+        if (f && Unoccluded(isect, reservoir.y->pLight))
+            L += SafeDiv(f * reservoir.y->L * reservoir.W, lambda.PDF());
+    }
+    return L;
+}
+
 std::unique_ptr<Integrator> Integrator::Create(
     const std::string &name, const ParameterDictionary &parameters, CameraHandle camera,
     SamplerHandle sampler, PrimitiveHandle aggregate, std::vector<LightHandle> lights,
@@ -3358,6 +3611,9 @@ std::unique_ptr<Integrator> Integrator::Create(
     else if (name == "sppm")
         integrator = SPPMIntegrator::Create(parameters, colorSpace, camera, sampler,
                                             aggregate, lights, loc);
+    else if (name == "ris")
+        integrator =
+            RISIntegrator::Create(parameters, camera, sampler, aggregate, lights, loc);
     else
         ErrorExit(loc, "%s: integrator type unknown.", name);
 

@@ -466,6 +466,65 @@ class SPPMIntegrator : public Integrator {
     const RGBColorSpace *colorSpace;
 };
 
+// RISIntegrator Definition
+class RISIntegrator : public Integrator {
+  public:
+    virtual void Render() override;
+    RISIntegrator(CameraHandle camera, SamplerHandle sampler, PrimitiveHandle aggregate,
+                  std::vector<LightHandle> lights,
+                  const std::string &light_sample_strategy, int M = 32, bool bias = true)
+        : Integrator(aggregate, lights),
+          camera_(camera),
+          sampler_prototype_(sampler),
+          M_(M),
+          bias_(bias),
+          light_sampler_(
+              LightSamplerHandle::Create(light_sample_strategy, lights, Allocator())) {}
+    static std::unique_ptr<RISIntegrator> Create(
+        const ParameterDictionary &parameters, CameraHandle camera, SamplerHandle sampler,
+        PrimitiveHandle aggregate, std::vector<LightHandle> lights, const FileLoc *loc);
+    virtual std::string ToString() const;
+
+  private:
+    template <typename T>
+    struct Reservoir {
+        T y;
+        bool is_valid = false;
+        float W = 0;
+        int M = 0;
+        float W_sum = 0;
+        void reset() {
+            W = 0;
+            M = 0;
+            W_sum = 0;
+            is_valid = false;
+        }
+        void update(SamplerHandle sampler, const T &sample, float weight) {
+            W_sum += weight;
+            M += 1;
+            if (W_sum == 0)
+                return;
+            float prob = weight / W_sum;
+            if (sampler.Get1D() < prob) {
+                y = sample;
+                is_valid = true;
+            }
+        }
+    };
+    int M_ = 32;
+    bool bias_ = true;
+    bool first_iter = true;
+    CameraHandle camera_;
+    SamplerHandle sampler_prototype_;
+    LightSamplerHandle light_sampler_;
+    std::vector<Reservoir<pstd::optional<LightLiSample>>> reservoirs;
+    std::vector<Reservoir<pstd::optional<LightLiSample>>> pre_reservoirs;
+    void evaluate_pixel(const Point2i &pPixel, int sampleIndex, SamplerHandle sampler,
+                        ScratchBuffer &scratchBuffer);
+    SampledSpectrum li(const Point2i &pPixel, RayDifferential ray,
+                       SampledWavelengths &lambda, SamplerHandle sampler,
+                       ScratchBuffer &scratchBuffer, VisibleSurface *visibleSurf);
+};
 }  // namespace pbrt
 
 #endif  // PBRT_CPU_INTEGRATORS_H
